@@ -1,2 +1,2 @@
 # dllguard
-A simple tool to check processes
+A simple tool to check your running processes
