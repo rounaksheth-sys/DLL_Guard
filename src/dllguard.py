@@ -24,7 +24,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 
 import psutil
@@ -42,9 +41,6 @@ USER_WRITABLE = ("\\appdata\\", "\\temp\\", "\\downloads\\", "\\desktop\\",
 
 # 2 points is MEDIUM. That is the lowest score I treat as flagged.
 FLAG_MIN_SCORE = 2
-
-# One PowerShell window per DLL was too slow, so I check 50 files at a time.
-SIG_BATCH_SIZE = 50
 
 CSV_FIELDS = ["module", "location", "flagged", "score", "risk", "signature",
               "signer", "reasons", "seen_in_processes", "processes"]
@@ -75,72 +71,33 @@ def in_app_folder(path, exe_dir):
     return path.startswith(exe_dir)
 
 
-def read_signature_json(out):
-    text = (out or "").strip()
-    if not text:
-        return []
-    data = json.loads(text)
-    # one file comes back as a dict, several files come back as a list
-    if isinstance(data, dict):
-        return [data]
-    return data
-
-
-def check_signatures_batch(paths):
-    # Get-AuthenticodeSignature is still slow. The win is starting PowerShell
-    # once for the whole batch instead of once per file.
-    # Paths go in a temp file because a long command line gets cut off.
-    if not paths:
-        return {}
-
-    handle, list_path = tempfile.mkstemp(prefix="dllguard_", suffix=".txt", text=True)
+def check_signature(path):
+    # Asks Windows (PowerShell) about ONE file. Slower than checking many at
+    # once, but each file is checked on its own, so one bad file cannot
+    # spoil the result for the others.
+    safe = path.replace("'", "''")      # a quote inside a path must be doubled
+    cmd = [
+        "powershell", "-NoProfile", "-Command",
+        f"$s = Get-AuthenticodeSignature -LiteralPath '{safe}'; "
+        "[pscustomobject]@{Status=$s.Status.ToString(); "
+        "Signer=$s.SignerCertificate.Subject} | ConvertTo-Json"
+    ]
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as f:
-            for p in paths:
-                f.write(p + "\n")
-
-        # the path list is read with LiteralPath, so a quote in a DLL path is safe
-        script = (
-            "$list = Get-Content -LiteralPath '"
-            + list_path.replace("'", "''")
-            + "' -Encoding UTF8; "
-            "$rows = foreach ($p in $list) { "
-            "  if (-not $p) { continue }; "
-            "  try { "
-            "    $s = Get-AuthenticodeSignature -LiteralPath $p; "
-            "    $signer = $null; "
-            "    if ($s.SignerCertificate) { $signer = $s.SignerCertificate.Subject }; "
-            "    [pscustomobject]@{Path=$p; Status=$s.Status.ToString(); Signer=$signer} "
-            "  } catch { "
-            "    [pscustomobject]@{Path=$p; Status='Error'; Signer=$null} "
-            "  } "
-            "}; "
-            "if ($rows) { $rows | ConvertTo-Json -Compress }"
-        )
-        cmd = ["powershell", "-NoProfile", "-NoLogo", "-Command", script]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        rows = read_signature_json(proc.stdout)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+        return json.loads(out)
     except (subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {p: {"Status": "Error", "Signer": None} for p in paths}
-    finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
+        return {"Status": "Error", "Signer": None}
 
-    found = {}
-    for row in rows:
-        path = (row.get("Path") or "").lower()
-        if path:
-            found[path] = {"Status": row.get("Status") or "Error",
-                           "Signer": row.get("Signer")}
-    for p in paths:
-        if p not in found:
-            found[p] = {"Status": "Error", "Signer": None}
-    return found
+
+def cached_signature(path):
+    # every file is checked once, then remembered
+    if path not in sig_cache:
+        sig_cache[path] = check_signature(path)
+    return sig_cache[path]
 
 
 def prefetch_signatures(paths):
+    # check all the new files up front so the user sees progress
     unknown = []
     seen = set()
     for path in paths:
@@ -151,19 +108,12 @@ def prefetch_signatures(paths):
     if not unknown:
         return
 
-    print(f"Checking signatures of {len(unknown)} file(s), "
-          f"{SIG_BATCH_SIZE} at a time...", flush=True)
-    for i in range(0, len(unknown), SIG_BATCH_SIZE):
-        chunk = unknown[i:i + SIG_BATCH_SIZE]
-        done = i + len(chunk)
-        print(f"  {done} of {len(unknown)}", flush=True)
-        sig_cache.update(check_signatures_batch(chunk))
-
-
-def cached_signature(path):
-    if path not in sig_cache:
-        prefetch_signatures([path])
-    return sig_cache[path]
+    print(f"Checking signatures of {len(unknown)} file(s), one at a time "
+          f"(this can take a few minutes)...", flush=True)
+    for i, path in enumerate(unknown, 1):
+        sig_cache[path] = check_signature(path)
+        if i % 25 == 0 or i == len(unknown):
+            print(f"  {i} of {len(unknown)}", flush=True)
 
 
 def get_cn(subject):
@@ -243,7 +193,7 @@ def find_pids(target):
 
 
 def collect_pid(pid):
-    # just the file list here. signatures happen after, in one batch
+    # just the file list here. signatures happen after, with progress
     start = time.time()
     dlls = set()
     try:
@@ -294,9 +244,6 @@ def score_process(p):
     p["rows"] = rows
     p["trusted"] = trusted
     p["total"] = len(p["dlls"])
-    n_flagged = sum(1 for r in rows if r["score"] >= FLAG_MIN_SCORE)
-    print(f"PID {p['pid']} ({p['name']}): {p['total']} modules, "
-          f"{n_flagged} flagged", flush=True)
 
 
 def score_collected(procs):
@@ -502,6 +449,10 @@ def print_summary(procs):
           f"{paint('LOW ' + str(counts['LOW']), 'LOW')}, "
           f"{paint('OK ' + str(counts['OK']), 'OK')} "
           "(option 5 if you want to see them)")
+    errors = sum(1 for r in files if r["signature"] == "Error")
+    if errors:
+        print(f"Warning: {errors} file(s) had signature status Error. The check "
+              "could not read them, so their scores may be too high.")
     print(f"Skipped (protected or already closed): {stats['skipped']}")
 
 
